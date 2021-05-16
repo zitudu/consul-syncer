@@ -53,7 +53,13 @@ func NewSyncer(cfg *Config) (*Syncer, error) {
 	}, nil
 }
 
-func (s *Syncer) Sync(ctx context.Context) error {
+func (s *Syncer) Sync(ctx context.Context) (err error) {
+	defer func() {
+		e := s.cleanNodeServices()
+		if err == nil {
+			err = e
+		}
+	}()
 	return s.watch(ctx)
 }
 
@@ -66,10 +72,10 @@ func (s *Syncer) watch(ctx context.Context) error {
 	defer cancel()
 	watchers := make(map[string]watcher)
 	for k, f := range watches {
-		s.logger.Info("init watch '%s'", k)
+		s.logger.Info(fmt.Sprintf("init watch '%s'", k))
 		w, err := f(&s.cfg)
 		if err != nil {
-			s.logger.Error("init watch '%s' error: %v", k, err)
+			s.logger.Error(fmt.Sprintf("init watch '%s' error: %v", k, err))
 			return err
 		}
 		watchers[k] = w
@@ -83,14 +89,18 @@ func (s *Syncer) watch(ctx context.Context) error {
 		w := w
 		go func() {
 			if err := w(ctx, s); err != nil {
-				s.logger.Error("watch '%s' error: %v", k, err)
+				s.logger.Error(fmt.Sprintf("watch '%s' error: %v", k, err))
+			} else {
+				s.logger.Info(fmt.Sprintf("watch '%s' stopped successfully", k))
 			}
 			wg.Done()
 		}()
 	}
 	wg.Wait()
-	for err := range errCh {
+	select {
+	case err := <-errCh:
 		return err
+	default:
 	}
 	return nil
 }
@@ -127,6 +137,59 @@ func (s *Syncer) syncService(name string, entries []*consulapi.ServiceEntry) err
 		}
 	}
 	return nil
+}
+
+func (s *Syncer) syncServicesDeregister(names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	s.logger.Info(fmt.Sprintf("deregister %d services: %v", len(names), names))
+	catalog := s.cTarget.Catalog()
+	agent := s.cTarget.Agent()
+	var e error
+	for _, name := range names {
+		services, _, err := catalog.Service(name, "", &s.cfg.QueryOptions)
+		if err != nil {
+			s.logger.Error(fmt.Sprintf("degregister %s, query service error: %v", name, err))
+			if e == nil {
+				e = err
+			}
+		}
+		for _, service := range services {
+			if err := agent.ServiceDeregister(service.ServiceID); err != nil {
+				s.logger.Error(fmt.Sprintf("degregister %s service (id: %s) error: %v", name, service.ServiceID, err))
+				if e == nil {
+					e = err
+				}
+			}
+		}
+	}
+	return e
+}
+
+func (s *Syncer) cleanNodeServices() error {
+	agent := s.cTarget.Agent()
+	nodeName, err := agent.NodeName()
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("clean node name error: %v", err))
+		return err
+	}
+	nodeServicesList, _, err := s.cTarget.Catalog().NodeServiceList(nodeName, &s.cfg.QueryOptions)
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("clean node services list error: %v", err))
+		return err
+	}
+	s.logger.Info(fmt.Sprintf("clean node %d service", len(nodeServicesList.Services)))
+	var e error
+	for _, service := range nodeServicesList.Services {
+		if err := agent.ServiceDeregister(service.ID); err != nil {
+			s.logger.Error(fmt.Sprintf("clean node service %s error: %v", service.ID, err))
+			if e == nil {
+				e = err
+			}
+		}
+	}
+	return e
 }
 
 func (s *Syncer) syncKVs(pairs []*consulapi.KVPair) error {

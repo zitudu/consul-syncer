@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"os/signal"
+	"syscall"
 
 	syncer "github.com/zitudu/consul-syncer"
 )
@@ -13,7 +15,9 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	if err := syncer.Sync(context.Background()); err != nil {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
+	defer cancel()
+	if err := syncer.Sync(ctx); err != nil {
 		panic(err)
 	}
 }

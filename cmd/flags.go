@@ -56,7 +56,7 @@ func init() {
 		if prefix != "" {
 			prefix = prefix + "-"
 		}
-		flag.StringVar(&c.Address, prefix+"addr", c.Address, fmt.Sprintf("Address of %s consul client", name))
+		flag.StringVar(&c.Address, prefix+"addr", "", fmt.Sprintf("Address of %s consul client", name))
 		flag.StringVar(&c.Scheme, prefix+"schema", c.Scheme, fmt.Sprintf("Schema of %s consul client", name))
 		flag.StringVar(&c.Datacenter, prefix+"dc", c.Datacenter, fmt.Sprintf("Datacenter of %s consul client", name))
 		flag.StringVar(&c.Token, prefix+"token", c.Token, fmt.Sprintf("Token of %s consul client", name))
@@ -65,7 +65,7 @@ func init() {
 		// TODO(zitudu): TLSConfig
 	}
 	clientConfig("source", "source", cfg.Source)
-	clientConfig("", "target", cfg.Target)
+	clientConfig("target", "target", cfg.Target)
 	var serviceNames, serviceTags, kvs, kvprefixs, events arrayFlags
 	flag.Var(&serviceNames, "service-name", "Services to sync, regexp")
 	flag.Var(&serviceTags, "service-tag", "Services with tags to sync, regexp")
@@ -101,6 +101,9 @@ func init() {
 		cfg.LoggerOptions.Output = f
 	}
 
+	if cfg.Source.Address == "" || cfg.Target.Address == "" {
+		panic("source, target address required")
+	}
 	if cfg.Source.Address == cfg.Target.Address {
 		panic("source, target consul must be two consuls")
 	}

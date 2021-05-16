@@ -2,7 +2,9 @@ package syncer
 
 import (
 	"context"
+	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 
 	consulapi "github.com/hashicorp/consul/api"
@@ -31,6 +33,7 @@ type watchPlans struct {
 	c      *consulapi.Client
 	logger hclog.Logger
 	stopCh chan struct{}
+	stop   bool
 }
 
 func newWatchPlans(name string, c *consulapi.Client, logger hclog.Logger) *watchPlans {
@@ -39,6 +42,7 @@ func newWatchPlans(name string, c *consulapi.Client, logger hclog.Logger) *watch
 		m:      make(map[string]*consulwatch.Plan),
 		c:      c,
 		logger: logger,
+		stopCh: make(chan struct{}),
 	}
 }
 
@@ -54,7 +58,7 @@ func (wps *watchPlans) Add(key string, params map[string]interface{}, handler co
 	defer wps.mux.Unlock()
 	wp, err := consulwatch.Parse(params)
 	if err != nil {
-		wps.logger.Error("%s '%s' watch plan error: %v", wps.name, key, err)
+		wps.logger.Error(fmt.Sprintf("%s '%s' watch plan error: %v", wps.name, key, err))
 		return err
 	}
 	wp.HybridHandler = handler
@@ -62,11 +66,41 @@ func (wps *watchPlans) Add(key string, params map[string]interface{}, handler co
 	wps.wg.Add(1)
 	go func() {
 		if err := wp.RunWithClientAndHclog(wps.c, wps.logger); err != nil {
-			wps.logger.Warn("%s '%s' watch stop with error: %v", wps.name, key, err)
+			wps.logger.Warn(fmt.Sprintf("%s '%s' watch stop with error: %v", wps.name, key, err))
 		}
 		wps.wg.Done()
 	}()
 	return nil
+}
+
+func (wps *watchPlans) RemoveOthers(keys []string) (removed []string) {
+	if len(keys) < 100 {
+		for k := range wps.m {
+			var found bool
+			for _, k2 := range keys {
+				if k == k2 {
+					found = true
+					break
+				}
+			}
+			if !found {
+				delete(wps.m, k)
+				removed = append(removed, k)
+			}
+		}
+	} else {
+		km := make(map[string]bool, len(keys))
+		for _, k := range keys {
+			km[k] = true
+		}
+		for k := range wps.m {
+			if !km[k] {
+				delete(wps.m, k)
+				removed = append(removed, k)
+			}
+		}
+	}
+	return
 }
 
 func (wps *watchPlans) Wait(ctx context.Context) {
@@ -84,15 +118,20 @@ func (wps *watchPlans) Wait(ctx context.Context) {
 func (wps *watchPlans) Close() {
 	wps.mux.Lock()
 	defer wps.mux.Unlock()
+	if wps.stop {
+		return
+	}
 	for k, wp := range wps.m {
 		if wp.IsStopped() {
 			continue
 		}
-		wps.logger.Info("stopping %s '%s' watch", wps.name, k)
+		wps.logger.Info(fmt.Sprintf("stopping %s '%s' watch", wps.name, k))
 		wp.Stop()
+		wps.logger.Info(fmt.Sprintf("stopped %s '%s' watch", wps.name, k))
 	}
 	wps.wg.Wait()
 	close(wps.stopCh)
+	wps.stop = true
 }
 
 func watchServices(c *Config) (watcher, error) {
@@ -108,14 +147,14 @@ func watchServices(c *Config) (watcher, error) {
 	}
 	var names, tags []*regexp.Regexp
 	for _, s := range c.ServiceNames {
-		r, err := regexp.Compile(s)
+		r, err := compileStringOrRegexp(s)
 		if err != nil {
 			return nil, err
 		}
 		names = append(names, r)
 	}
 	for _, s := range c.ServiceTags {
-		r, err := regexp.Compile(s)
+		r, err := compileStringOrRegexp(s)
 		if err != nil {
 			return nil, err
 		}
@@ -130,22 +169,24 @@ func watchServices(c *Config) (watcher, error) {
 			for _, r := range names {
 				if r.MatchString(serviceName) {
 					out = append(out, serviceName)
-					break SERVICES_LOOP
+					continue SERVICES_LOOP
 				}
 			}
-			b := true
-		SERVICE_TAGS_LOOP:
-			for _, tag := range ts {
-				for _, r := range tags {
-					if r.MatchString(tag) {
-						continue SERVICE_TAGS_LOOP
+			if len(tags) > 0 {
+				b := true
+			SERVICE_TAGS_LOOP:
+				for _, tag := range ts {
+					for _, r := range tags {
+						if r.MatchString(tag) {
+							continue SERVICE_TAGS_LOOP
+						}
 					}
+					b = false
+					break
 				}
-				b = false
-				break
-			}
-			if b {
-				out = append(out, serviceName)
+				if b {
+					out = append(out, serviceName)
+				}
 			}
 		}
 		ch <- out
@@ -170,19 +211,20 @@ func watchServices(c *Config) (watcher, error) {
 						wps.Add(
 							service,
 							map[string]interface{}{
-								"type":  "service",
-								"name":  service,
-								"stale": s.cfg.QueryOptions.AllowStale,
+								"type":    "service",
+								"service": service,
+								"stale":   s.cfg.QueryOptions.AllowStale,
 							},
 							func(bpv consulwatch.BlockingParamVal, val interface{}) {
 								entries := val.([]*consulapi.ServiceEntry)
 								if err := s.syncService(service, entries); err != nil {
-									logger.Error("service '%s' sync error: %v", service, err)
+									logger.Error(fmt.Sprintf("service '%s' sync error: %v", service, err))
 								}
 							},
 						)
 					}
 				}
+				s.syncServicesDeregister(wps.RemoveOthers(services))
 			}
 		}()
 
@@ -207,14 +249,14 @@ func watchKVs(c *Config) (watcher, error) {
 				switch v := val.(type) {
 				case *consulapi.KVPair:
 					if err := s.syncKVs([]*consulapi.KVPair{v}); err != nil {
-						s.logger.Error("key '%s' sync error: %v", k, err)
+						s.logger.Error(fmt.Sprintf("key '%s' sync error: %v", k, err))
 					}
 				case consulapi.KVPairs:
 					if err := s.syncKVs(v); err != nil {
-						s.logger.Error("keyprefix '%s' sync error: %v", k, err)
+						s.logger.Error(fmt.Sprintf("keyprefix '%s' sync error: %v", k, err))
 					}
 				default:
-					s.logger.Error("unexpected watch value of key/keyprefix: %v", v)
+					s.logger.Error(fmt.Sprintf("unexpected watch value of key/keyprefix: %v", v))
 					return
 				}
 			}
@@ -260,7 +302,7 @@ func watchEvents(c *Config) (watcher, error) {
 				func(bpv consulwatch.BlockingParamVal, val interface{}) {
 					evts := val.([]*consulapi.UserEvent)
 					if err := s.syncEvents(evts); err != nil {
-						s.logger.Error("event '%s' sync error: %v", event, err)
+						s.logger.Error(fmt.Sprintf("event '%s' sync error: %v", event, err))
 					}
 				},
 			)
@@ -271,4 +313,14 @@ func watchEvents(c *Config) (watcher, error) {
 		wps.Wait(ctx)
 		return nil
 	}, nil
+}
+
+func compileStringOrRegexp(s string) (*regexp.Regexp, error) {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "re:") {
+		s = strings.TrimPrefix(s, "re:")
+	} else {
+		s = "^" + s + "$"
+	}
+	return regexp.Compile(s)
 }
