@@ -1,59 +1,96 @@
 package syncer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
-	"github.com/antonmedv/expr"
 	consulapi "github.com/hashicorp/consul/api"
-	consulwatch "github.com/hashicorp/consul/api/watch"
 	"github.com/hashicorp/go-hclog"
 )
 
 type Config struct {
-	Source, Target   *consulapi.Config
-	RegisterServices []string
-	ServiceNames     []string
-	ServiceTags      []string
-	KVs              []string
-	KVPrefixs        []string
-	Events           []string
-	ExprOptions      []expr.Option
-	Check            bool
-	QueryOptions     consulapi.QueryOptions
-	WriteOptions     consulapi.WriteOptions
+	Source, Target *consulapi.Config
+	QueryOptions   consulapi.QueryOptions
+	WriteOptions   consulapi.WriteOptions
+	LoggerOptions  hclog.LoggerOptions
+	ServiceNames   []string
+	ServiceTags    []string
+	KVs            []string
+	KVPrefixs      []string
+	Events         []string
+	Check          bool
 }
 
-func NewConfig() Config {
-	return Config{}
+func NewConfig() *Config {
+	return &Config{
+		Source:        consulapi.DefaultConfig(),
+		Target:        consulapi.DefaultConfig(),
+		LoggerOptions: *hclog.DefaultOptions,
+	}
 }
 
 type Syncer struct {
 	cfg        Config
-	wp         *consulwatch.Plan
 	c, cTarget *consulapi.Client
 	logger     hclog.Logger
 }
 
-func NewSyncer(cfg Config) (*Syncer, error) {
-	wp, err := consulwatch.Parse(map[string]interface{}{
-		"type": "services",
-	})
+func NewSyncer(cfg *Config) (*Syncer, error) {
+	c, err := consulapi.NewClient(cfg.Source)
 	if err != nil {
 		return nil, err
 	}
-	wp.HybridHandler = func(bpv consulwatch.BlockingParamVal, val interface{}) {
-		switch val.(type) {
-		}
+	cTarget, err := consulapi.NewClient(cfg.Target)
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	return &Syncer{
+		*cfg, c, cTarget, hclog.New(&cfg.LoggerOptions),
+	}, nil
 }
 
-func (s *Syncer) watch() error {
+func (s *Syncer) Sync(ctx context.Context) error {
+	return s.watch(ctx)
+}
+
+func (s *Syncer) watch(ctx context.Context) error {
 	if s == nil {
 		return nil
+	}
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	defer cancel()
+	watchers := make(map[string]watcher)
+	for k, f := range watches {
+		s.logger.Info("init watch '%s'", k)
+		w, err := f(&s.cfg)
+		if err != nil {
+			s.logger.Error("init watch '%s' error: %v", k, err)
+			return err
+		}
+		watchers[k] = w
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(watchers))
+	errCh := make(chan error, len(watchers))
+	defer close(errCh)
+	for k, w := range watchers {
+		k := k
+		w := w
+		go func() {
+			if err := w(ctx, s); err != nil {
+				s.logger.Error("watch '%s' error: %v", k, err)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	for err := range errCh {
+		return err
 	}
 	return nil
 }

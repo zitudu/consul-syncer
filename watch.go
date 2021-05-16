@@ -10,9 +10,9 @@ import (
 	"github.com/hashicorp/go-hclog"
 )
 
-type watcher func(context.Context, *Syncer) error
+type watcher func(ctx context.Context, s *Syncer) error
 
-func noopWatcher(_ctx context.Context, _syncer *Syncer) error {
+func noopWatcher(_ctx context.Context, _s *Syncer) error {
 	return nil
 }
 
@@ -27,8 +27,10 @@ type watchPlans struct {
 	m    map[string]*consulwatch.Plan
 	wg   sync.WaitGroup
 
+	mux    sync.Mutex
 	c      *consulapi.Client
 	logger hclog.Logger
+	stopCh chan struct{}
 }
 
 func newWatchPlans(name string, c *consulapi.Client, logger hclog.Logger) *watchPlans {
@@ -41,11 +43,15 @@ func newWatchPlans(name string, c *consulapi.Client, logger hclog.Logger) *watch
 }
 
 func (wps *watchPlans) Exists(key string) bool {
+	wps.mux.Lock()
+	defer wps.mux.Unlock()
 	_, ok := wps.m[key]
 	return ok
 }
 
 func (wps *watchPlans) Add(key string, params map[string]interface{}, handler consulwatch.HybridHandlerFunc) error {
+	wps.mux.Lock()
+	defer wps.mux.Unlock()
 	wp, err := consulwatch.Parse(params)
 	if err != nil {
 		wps.logger.Error("%s '%s' watch plan error: %v", wps.name, key, err)
@@ -63,12 +69,30 @@ func (wps *watchPlans) Add(key string, params map[string]interface{}, handler co
 	return nil
 }
 
+func (wps *watchPlans) Wait(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			wps.Close()
+			return
+		case <-wps.stopCh:
+			return
+		}
+	}
+}
+
 func (wps *watchPlans) Close() {
+	wps.mux.Lock()
+	defer wps.mux.Unlock()
 	for k, wp := range wps.m {
+		if wp.IsStopped() {
+			continue
+		}
 		wps.logger.Info("stopping %s '%s' watch", wps.name, k)
 		wp.Stop()
 	}
 	wps.wg.Wait()
+	close(wps.stopCh)
 }
 
 func watchServices(c *Config) (watcher, error) {
@@ -127,14 +151,12 @@ func watchServices(c *Config) (watcher, error) {
 		ch <- out
 	}
 
-	var once sync.Once
-
 	return func(ctx context.Context, s *Syncer) error {
 		logger := s.logger
-		once.Do(func() {
-			wps := newWatchPlans("service", s.c, s.logger)
-			defer wps.Close()
+		wps := newWatchPlans("service", s.c, s.logger)
+		defer wps.Close()
 
+		go func() {
 			for {
 				var services []string
 				select {
@@ -162,7 +184,13 @@ func watchServices(c *Config) (watcher, error) {
 					}
 				}
 			}
-		})
+		}()
+
+		go func() {
+			wps.Wait(ctx)
+			wp.Stop()
+		}()
+
 		return wp.RunWithClientAndHclog(s.c, s.logger)
 	}, nil
 }
@@ -173,6 +201,7 @@ func watchKVs(c *Config) (watcher, error) {
 	}
 	return func(ctx context.Context, s *Syncer) error {
 		wps := newWatchPlans("key/keyprefix", s.c, s.logger)
+		defer wps.Close()
 		handler := func(k string) consulwatch.HybridHandlerFunc {
 			return func(bpv consulwatch.BlockingParamVal, val interface{}) {
 				switch v := val.(type) {
@@ -208,6 +237,7 @@ func watchKVs(c *Config) (watcher, error) {
 				return err
 			}
 		}
+		wps.Wait(ctx)
 		return nil
 	}, nil
 }
@@ -218,6 +248,7 @@ func watchEvents(c *Config) (watcher, error) {
 	}
 	return func(ctx context.Context, s *Syncer) error {
 		wps := newWatchPlans("event", s.c, s.logger)
+		defer wps.Close()
 		for _, event := range c.Events {
 			event := event
 			err := wps.Add(
@@ -237,6 +268,7 @@ func watchEvents(c *Config) (watcher, error) {
 				return err
 			}
 		}
+		wps.Wait(ctx)
 		return nil
 	}, nil
 }
