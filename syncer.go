@@ -231,6 +231,7 @@ func (s *Syncer) syncKVs(pairs []*consulapi.KVPair) error {
 		_, err := kv.Put(pairs[0], &s.cfg.WriteOptions)
 		return err
 	}
+	s.logger.Info(fmt.Sprintf("put %d kvs", len(pairs)))
 	txn := s.cTarget.Txn()
 	var opts []*consulapi.TxnOp
 	for _, pair := range pairs {
@@ -263,6 +264,10 @@ func (s *Syncer) syncKVs(pairs []*consulapi.KVPair) error {
 }
 
 func (s *Syncer) syncEvents(events []*consulapi.UserEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	s.logger.Info(fmt.Sprintf("fire %d events", len(events)))
 	e := s.cTarget.Event()
 	for _, event := range events {
 		_, _, err := e.Fire(event, &s.cfg.WriteOptions)

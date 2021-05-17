@@ -247,6 +247,8 @@ func watchKVs(c *Config) (watcher, error) {
 		handler := func(k string) consulwatch.HybridHandlerFunc {
 			return func(bpv consulwatch.BlockingParamVal, val interface{}) {
 				switch v := val.(type) {
+				case nil:
+					s.logger.Info("kv/kvprefix got nil")
 				case *consulapi.KVPair:
 					if err := s.syncKVs([]*consulapi.KVPair{v}); err != nil {
 						s.logger.Error(fmt.Sprintf("key '%s' sync error: %v", k, err))
