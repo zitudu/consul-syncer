@@ -13,16 +13,17 @@ import (
 )
 
 type Config struct {
-	Source, Target *consulapi.Config
-	QueryOptions   consulapi.QueryOptions
-	WriteOptions   consulapi.WriteOptions
-	LoggerOptions  hclog.LoggerOptions
-	ServiceNames   []string
-	ServiceTags    []string
-	KVs            []string
-	KVPrefixs      []string
-	Events         []string
-	Check          bool
+	Source, Target   *consulapi.Config
+	QueryOptions     consulapi.QueryOptions
+	WriteOptions     consulapi.WriteOptions
+	LoggerOptions    hclog.LoggerOptions
+	ServiceNames     []string
+	ServiceTags      []string
+	KVs              []string
+	KVPrefixs        []string
+	Events           []string
+	Check            bool
+	ExternalNodeMeta map[string]string
 }
 
 func NewConfig() *Config {
@@ -30,6 +31,9 @@ func NewConfig() *Config {
 		Source:        consulapi.DefaultConfig(),
 		Target:        consulapi.DefaultConfig(),
 		LoggerOptions: *hclog.DefaultOptions,
+		ExternalNodeMeta: map[string]string{
+			"consul-syncer-external": "true",
+		},
 	}
 }
 
@@ -55,7 +59,7 @@ func NewSyncer(cfg *Config) (*Syncer, error) {
 
 func (s *Syncer) Sync(ctx context.Context) (err error) {
 	defer func() {
-		e := s.cleanNodeServices()
+		e := s.cleanImportedServices()
 		if err == nil {
 			err = e
 		}
@@ -105,34 +109,35 @@ func (s *Syncer) watch(ctx context.Context) error {
 	return nil
 }
 
-func (s *Syncer) syncService(name string, entries []*consulapi.ServiceEntry) error {
-	agent := s.cTarget.Agent()
-	for i, entry := range entries {
-		if i == 0 {
-			if err := agent.ServiceDeregister(entry.Service.ID); err != nil {
-				return err
-			}
+func (s *Syncer) syncService(entries []*consulapi.ServiceEntry) error {
+	catalog := s.cTarget.Catalog()
+	s.logger.Info(fmt.Sprintf("register %d services", len(entries)))
+	for _, entry := range entries {
+		optsDe := &consulapi.CatalogDeregistration{
+			Node:       entry.Node.Node,
+			Address:    entry.Node.Address,
+			Datacenter: entry.Node.Datacenter,
+			ServiceID:  entry.Service.ID,
+			Namespace:  entry.Service.Namespace,
 		}
-		opts := &consulapi.AgentServiceRegistration{
-			Kind:              entry.Service.Kind,
-			ID:                entry.Service.ID,
-			Name:              name,
-			Tags:              entry.Service.Tags,
-			Port:              entry.Service.Port,
-			Address:           entry.Service.Address,
-			TaggedAddresses:   entry.Service.TaggedAddresses,
-			EnableTagOverride: entry.Service.EnableTagOverride,
-			Meta:              entry.Service.Meta,
-			Weights:           &entry.Service.Weights,
-			Proxy:             entry.Service.Proxy,
-			Connect:           entry.Service.Connect,
-			Namespace:         entry.Service.Namespace,
+		s.logger.Debug("catalog deregister", optsDe)
+		if _, err := catalog.Deregister(optsDe, &s.cfg.WriteOptions); err != nil {
+			return err
+		}
+		opts := &consulapi.CatalogRegistration{
+			Node:            entry.Node.Node,
+			Address:         entry.Node.Address,
+			TaggedAddresses: entry.Node.TaggedAddresses,
+			NodeMeta:        s.appendExternalNodeMeta(entry.Node.Meta),
+			Datacenter:      entry.Node.Datacenter,
+			Service:         entry.Service,
+			SkipNodeUpdate:  false,
 		}
 		if s.cfg.Check {
-			opts.Check = entry.Service.Connect.SidecarService.Check
-			opts.Checks = entry.Service.Connect.SidecarService.Checks
+			opts.Checks = entry.Checks
 		}
-		if err := agent.ServiceRegister(opts); err != nil {
+		s.logger.Debug("catalog register", opts)
+		if _, err := catalog.Register(opts, &s.cfg.WriteOptions); err != nil {
 			return err
 		}
 	}
@@ -145,7 +150,6 @@ func (s *Syncer) syncServicesDeregister(names []string) error {
 	}
 	s.logger.Info(fmt.Sprintf("deregister %d services: %v", len(names), names))
 	catalog := s.cTarget.Catalog()
-	agent := s.cTarget.Agent()
 	var e error
 	for _, name := range names {
 		services, _, err := catalog.Service(name, "", &s.cfg.QueryOptions)
@@ -156,7 +160,17 @@ func (s *Syncer) syncServicesDeregister(names []string) error {
 			}
 		}
 		for _, service := range services {
-			if err := agent.ServiceDeregister(service.ServiceID); err != nil {
+			opts := &consulapi.CatalogDeregistration{
+				Node:       service.Node,
+				Address:    service.Address,
+				Datacenter: service.Datacenter,
+				ServiceID:  service.ServiceID,
+				Namespace:  service.Namespace,
+			}
+			if s.cfg.Check && len(service.Checks) == 1 {
+				opts.CheckID = service.Checks[0].CheckID
+			}
+			if _, err := catalog.Deregister(opts, &s.cfg.WriteOptions); err != nil {
 				s.logger.Error(fmt.Sprintf("degregister %s service (id: %s) error: %v", name, service.ServiceID, err))
 				if e == nil {
 					e = err
@@ -167,29 +181,48 @@ func (s *Syncer) syncServicesDeregister(names []string) error {
 	return e
 }
 
-func (s *Syncer) cleanNodeServices() error {
-	agent := s.cTarget.Agent()
-	nodeName, err := agent.NodeName()
+func (s *Syncer) cleanImportedServices() error {
+	s.logger.Info("cleaning imported services")
+	catalog := s.cTarget.Catalog()
+	q := s.cfg.QueryOptions
+	q.NodeMeta = s.cfg.ExternalNodeMeta
+	nodes, _, err := catalog.Nodes(&q)
 	if err != nil {
-		s.logger.Error(fmt.Sprintf("clean node name error: %v", err))
+		s.logger.Error(fmt.Sprintf("get node lists error: %v", err))
 		return err
 	}
-	nodeServicesList, _, err := s.cTarget.Catalog().NodeServiceList(nodeName, &s.cfg.QueryOptions)
-	if err != nil {
-		s.logger.Error(fmt.Sprintf("clean node services list error: %v", err))
-		return err
-	}
-	s.logger.Info(fmt.Sprintf("clean node %d service", len(nodeServicesList.Services)))
+	s.logger.Info(fmt.Sprintf("cleaning imported services: %d nodes", len(nodes)))
+	var errCount int
 	var e error
-	for _, service := range nodeServicesList.Services {
-		if err := agent.ServiceDeregister(service.ID); err != nil {
-			s.logger.Error(fmt.Sprintf("clean node service %s error: %v", service.ID, err))
-			if e == nil {
-				e = err
+	for _, node := range nodes {
+		s.logger.Info(fmt.Sprintf("cleaning imported services: node %s", node.Address))
+		nodeServicesList, _, err := catalog.NodeServiceList(node.Address, &s.cfg.QueryOptions)
+		if err != nil {
+			s.logger.Error(fmt.Sprintf("clean node services list error: %v", err))
+			return err
+		}
+		s.logger.Info(fmt.Sprintf("clean node %d service", len(nodeServicesList.Services)))
+		for _, service := range nodeServicesList.Services {
+			opts := &consulapi.CatalogDeregistration{
+				Node:       nodeServicesList.Node.Node,
+				Address:    nodeServicesList.Node.Address,
+				Datacenter: nodeServicesList.Node.Datacenter,
+				ServiceID:  service.ID,
+				Namespace:  service.Namespace,
+			}
+			if _, err := catalog.Deregister(opts, &s.cfg.WriteOptions); err != nil {
+				errCount += 1
+				s.logger.Error(fmt.Sprintf("clean node service %s error: %v", service.ID, err))
+				if e == nil {
+					e = err
+				}
 			}
 		}
 	}
-	return e
+	if e != nil {
+		return fmt.Errorf("%d errors: %v", errCount, e)
+	}
+	return nil
 }
 
 func (s *Syncer) syncKVs(pairs []*consulapi.KVPair) error {
@@ -238,4 +271,15 @@ func (s *Syncer) syncEvents(events []*consulapi.UserEvent) error {
 		}
 	}
 	return nil
+}
+
+func (s *Syncer) appendExternalNodeMeta(meta map[string]string) map[string]string {
+	m := make(map[string]string, len(meta)+len(s.cfg.ExternalNodeMeta))
+	for k, v := range meta {
+		m[k] = v
+	}
+	for k, v := range s.cfg.ExternalNodeMeta {
+		m[k] = v
+	}
+	return m
 }

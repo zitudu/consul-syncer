@@ -217,7 +217,7 @@ func watchServices(c *Config) (watcher, error) {
 							},
 							func(bpv consulwatch.BlockingParamVal, val interface{}) {
 								entries := val.([]*consulapi.ServiceEntry)
-								if err := s.syncService(service, entries); err != nil {
+								if err := s.syncService(entries); err != nil {
 									logger.Error(fmt.Sprintf("service '%s' sync error: %v", service, err))
 								}
 							},

@@ -66,6 +66,7 @@ func init() {
 	}
 	clientConfig("source", "source", cfg.Source)
 	clientConfig("target", "target", cfg.Target)
+
 	var serviceNames, serviceTags, kvs, kvprefixs, events arrayFlags
 	flag.Var(&serviceNames, "service-name", "Services to sync, regexp")
 	flag.Var(&serviceTags, "service-tag", "Services with tags to sync, regexp")
@@ -73,8 +74,10 @@ func init() {
 	flag.Var(&kvprefixs, "kv-prefix", "KVs prefixed to sync")
 	flag.Var(&events, "event", "Events to sync")
 	flag.BoolVar(&cfg.QueryOptions.AllowStale, "stale", true, "Stale allows query from followers")
+
 	var logLevel loggerLevel
 	flag.Var(&logLevel, "log-level", "Log level: none, trace, debug, info, warn, error")
+
 	logOut := flag.String("log-out", "stderr", "Log out: stdout, stderr, or any file path")
 	flag.BoolVar(&cfg.LoggerOptions.JSONFormat, "log-json", false, "Control if the output should be in JSON")
 	flag.BoolVar(&cfg.LoggerOptions.IncludeLocation, "log-location", false, "Include file and line information in each log line")
@@ -87,6 +90,7 @@ func init() {
 	cfg.KVs = kvs
 	cfg.KVPrefixs = kvprefixs
 	cfg.Events = events
+	cfg.LoggerOptions.Level = hclog.Level(logLevel)
 	*logOut = strings.ToLower(*logOut)
 	switch *logOut {
 	case "stdout":
