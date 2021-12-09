@@ -43,3 +43,7 @@ To watch events from target and fire them to source consul, use `-event name` fl
 ### Hybrid
 
 All of services, kvs and events support zero or more options and hybrid usage.
+
+## License
+
+MPL-2.0 License
