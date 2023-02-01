@@ -196,7 +196,7 @@ func (s *Syncer) cleanImportedServices() error {
 	var e error
 	for _, node := range nodes {
 		s.logger.Info(fmt.Sprintf("cleaning imported services: node %s", node.Address))
-		nodeServicesList, _, err := catalog.NodeServiceList(node.Address, &s.cfg.QueryOptions)
+		nodeServicesList, _, err := catalog.NodeServiceList(node.Node, &s.cfg.QueryOptions)
 		if err != nil {
 			s.logger.Error(fmt.Sprintf("clean node services list error: %v", err))
 			return err
